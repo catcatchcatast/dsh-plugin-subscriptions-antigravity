@@ -1,0 +1,301 @@
+// 变更追溯：CHG-20261124-154130-quota-prefetch-d570c33d；记录：.codex/doc/change-history/CHG-20261124-154130-quota-prefetch-d570c33d.md
+// 变更追溯：CHG-20261124-152158-preview-parity-2fdd82c1；记录：.codex/doc/change-history/CHG-20261124-152158-preview-parity-2fdd82c1.md
+// 变更追溯：CHG-20261124-145318-quota-models-47c9e254；记录：.codex/doc/change-history/CHG-20261124-145318-quota-models-47c9e254.md
+// 变更追溯：CHG-20261124-113809-agy-shell-c58464c9；记录：.codex/doc/change-history/CHG-20261124-113809-agy-shell-c58464c9.md
+// 变更追溯：CHG-20261124-upstream-0914-b8023110；记录：.codex/doc/change-history/CHG-20261124-upstream-0914-b8023110.md
+// 变更追溯：CHG-20261103-143200-subscription-account-audit-b8023110；记录：.codex/doc/change-history/CHG-20261103-143200-subscription-account-audit-b8023110.md
+// 变更追溯：所属电脑底栏浏览器回归；记录：.codex/doc/change-history/CHG-20261113-owner-quota-b8023110.md
+// Optional offline UI check: PLAYWRIGHT_PATH=/path/to/playwright node test/subscription-usage-browser.mjs
+// No running DSH server, real accounts, credentials, screenshots or model writes.
+import assert from 'node:assert/strict'
+import { readdir } from 'node:fs/promises'
+import { resolve } from 'node:path'
+import { pathToFileURL } from 'node:url'
+const dependencies = await readdir('node_modules/.pnpm')
+const packagePath = name => resolve('node_modules/.pnpm', dependencies.find(entry => entry.startsWith(`${name}@`)), 'node_modules', name)
+const { build } = await import(pathToFileURL(`${packagePath('rolldown')}/dist/index.mjs`))
+const { chromium } = await import(pathToFileURL(`${process.env.PLAYWRIGHT_PATH}/index.mjs`))
+const result = await build({
+  input: 'test/subscription-usage-browser.fixture.tsx',
+  resolve: { alias: { 'react-dom/client': `${packagePath('react-dom')}/client.js` } },
+  transform: { define: { 'process.env.NODE_ENV': '"production"' } },
+  // 变更追溯：旧宿主不导出两个浮层Hook；记录：.codex/doc/change-history/CHG-20261114-badge-overlay-b8023110.md
+  plugins: [{ name: 'test-css', load(id) { return id.endsWith('.css') ? 'export default {}' : null } }, {
+    name: 'host-without-popover-hooks',
+    transform(code, id) {
+      if (!id.includes('dsh-client-ui-primitives') || !id.endsWith('/lib/index.js')) return null
+      // Preserve every other real primitive, but remove the two missing host exports.
+      const transformed = code.replace(/export \{([^}]+)\}/g, (_, entries) => `export {${entries
+        .split(',').filter(entry => !['useAnchoredPosition', 'useDismissOnOutsidePointer'].includes(entry.trim())).join(',')}}`)
+      assert.notEqual(transformed, code, 'fixture removed both optional host hooks')
+      return transformed
+    },
+  }],
+  output: { format: 'iife' }, write: false,
+})
+const code = result.output.find(file => file.type === 'chunk').code
+const browser = await chromium.launch({ headless: true, ...(process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE ? { executablePath: process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE } : {}) })
+try {
+  const context = await browser.newContext({ viewport: { width: 900, height: 900 } })
+  await context.route('**/*', route => route.fulfill({ status: 200, contentType: route.request().url().endsWith('/app.js') ? 'text/javascript; charset=utf-8' : 'text/html; charset=utf-8',
+    body: route.request().url().endsWith('/app.js') ? code : '<!doctype html><meta charset="utf-8"><div id="root"></div><script src="/app.js"></script>' }))
+  const page = await context.newPage()
+  const errors = []
+  page.on('pageerror', error => { errors.push(error.message); console.error(error.message) })
+  await page.goto('http://subscription-usage.test/')
+  const control = page.getByRole('combobox', { name: 'Status-bar quota display', exact: true })
+  const badge = page.locator('[data-composer-stats] button')
+  const title = 'Subscription usage'
+  const panel = page.getByRole('dialog', { name: title, exact: true })
+  await control.waitFor()
+  await page.waitForFunction(() => Number(document.documentElement.dataset.modelReads) >= 2)
+  assert.equal(await badge.count(), 0, 'no unrelated provider without view history')
+  const choose = async (name, provider) => {
+    const reads = await page.evaluate(() => Number(document.documentElement.dataset.modelReads))
+    await page.getByRole('button', { name, exact: true }).click()
+    await page.waitForFunction(({ reads, provider }) => Number(document.documentElement.dataset.modelReads) > reads && document.documentElement.dataset.lastRead === provider, { reads, provider })
+  }
+  for (const [name, provider, expected] of [
+    ['codex', 'codex', 'Codex'], ['grok', 'grok', 'Grok'], ['antigravity', 'antigravity', 'Antigravity'],
+  ]) {
+    await choose(name, provider)
+    await page.waitForFunction(() => document.querySelector('[data-composer-stats] button')?.textContent?.includes('%'))
+    assert.equal(await badge.count(), 1)
+    assert.match(await badge.innerText(), new RegExp(`^${expected} .*%`))
+    assert.equal((await badge.innerText()).includes('|'), false)
+    // A non-subscription model hides the pill instead of keeping the last subscription.
+    await choose('api', 'deepseek')
+    await badge.waitFor({ state: 'detached' })
+    assert.equal(await badge.count(), 0, `${expected} is not left on screen after an API model`)
+  }
+  await choose('codex', 'codex')
+  await page.waitForFunction(() => document.querySelector('[data-composer-stats] button')?.textContent?.includes(' · actual ·'))
+  assert.match(await badge.innerText(), /71%.* · actual ·/ )
+  assert.equal((await badge.innerText()).includes('@'), false, 'actual-account label hides the email domain')
+  assert.equal((await badge.innerText()).includes('13%'), false)
+  await page.getByRole('button', { name: 'Unknown account', exact: true }).click()
+  await page.waitForFunction(() => document.querySelector('[data-composer-stats] button')?.textContent?.includes('No observed account'))
+  assert.equal((await badge.innerText()).includes('%'), false, 'unknown never borrows default quota')
+  await page.getByRole('button', { name: 'Dispatch default', exact: true }).click()
+  await page.waitForFunction(() => document.querySelector('[data-composer-stats] button')?.textContent?.includes(' · default ·'))
+  assert.match(await badge.innerText(), /13%.* · default ·.*in use/)
+  await page.getByRole('button', { name: 'Dispatch actual', exact: true }).click()
+  await page.waitForFunction(() => document.querySelector('[data-composer-stats] button')?.textContent?.includes(' · actual ·'))
+  assert.match(await badge.innerText(), /71%.* · actual ·/)
+
+  await choose('grok', 'grok')
+  await page.getByRole('button', { name: 'Rename Grok', exact: true }).click()
+  assert.match(await badge.innerText(), /^我的 Grok /)
+  await badge.click()
+  await panel.waitFor()
+  const assertPanelInsideViewport = async () => {
+    const box = await panel.boundingBox()
+    const viewport = page.viewportSize()
+    assert.ok(box && viewport && box.x >= 11 && box.y >= 11 && box.x + box.width <= viewport.width - 11 && box.y + box.height <= viewport.height - 11)
+  }
+  await assertPanelInsideViewport()
+  await page.setViewportSize({ width: 360, height: 720 })
+  await page.waitForFunction(() => {
+    const box = document.querySelector('[role=dialog]')?.getBoundingClientRect()
+    return box && box.left >= 11 && box.top >= 11 && box.right <= innerWidth - 11 && box.bottom <= innerHeight - 11
+  })
+  await assertPanelInsideViewport()
+  await page.setViewportSize({ width: 900, height: 900 })
+  assert.match(await panel.locator('tbody').first().innerText(), /^我的 Grok/)
+  await page.keyboard.press('Escape')
+  await page.getByRole('button', { name: 'Reset Grok', exact: true }).click()
+  assert.match(await badge.innerText(), /^Grok /)
+  await choose('antigravity', 'antigravity')
+  console.log('40%: single-provider selection and non-subscription hiding verified')
+  await badge.click()
+  await panel.waitFor()
+  const anti = panel.locator('tbody').first()
+  await anti.getByText('bridge-two', { exact: true }).waitFor()
+  await anti.getByRole('progressbar').first().waitFor()
+  assert.match(await panel.locator('tbody').first().innerText(), /^Antigravity/)
+  assert.equal(await anti.getByRole('progressbar').count(), 2)
+  await anti.getByRole('progressbar').first().waitFor()
+  assert.equal(await anti.getByRole('progressbar').first().getAttribute('aria-valuetext'), '29% used')
+  assert.doesNotMatch(await anti.innerText(), /This Mac/)
+  assert.deepEqual(await panel.getByRole('columnheader').allTextContents(), ['Quota item', 'Used', 'Until reset'])
+  const reset = anti.locator('button.dsh-quota-reset').first()
+  assert.doesNotMatch(await reset.innerText(), /[~≈]|about/i)
+  await reset.focus()
+  await page.keyboard.press('Enter')
+  const exact = page.getByRole('dialog', { name: 'Gemini · Weekly', exact: true })
+  await exact.waitFor()
+  assert.match(await exact.innerText(), /Reset: .*\d{1,2}:\d{2}:\d{2}/)
+  await page.keyboard.press('Escape')
+  await exact.waitFor({ state: 'hidden' })
+  assert.equal(await panel.isVisible(), true)
+  assert.match(await badge.innerText(), /30% used.*Local bridge/)
+  await page.keyboard.press('Escape')
+  await panel.waitFor({ state: 'detached' })
+  await choose('denied', 'antigravity')
+  await page.waitForFunction(() => document.documentElement.dataset.bridgeModel === 'gemini-non-entitled')
+  assert.match(await badge.innerText(), /Current model quota unavailable/)
+  assert.doesNotMatch(await badge.innerText(), /%/)
+  // Change the preference from a second tab while the quota dialog is open.
+  const other = await context.newPage()
+  await other.goto('http://subscription-usage.test/')
+  const otherControl = other.getByRole('combobox', { name: 'Status-bar quota display', exact: true })
+  await otherControl.selectOption('hidden')
+  await badge.waitFor({ state: 'detached' })
+  await panel.waitFor({ state: 'detached' })
+  assert.equal(await control.inputValue(), 'hidden')
+  await page.reload()
+  await control.waitFor()
+  assert.equal(await control.inputValue(), 'hidden')
+  await choose('codex', 'codex')
+  assert.equal(await badge.count(), 0)
+  // A page that loads hidden never asks for usage; showing it refreshes at once.
+  assert.equal(await page.evaluate(() => document.documentElement.dataset.statusCalls), undefined)
+  await control.selectOption('recent')
+  await badge.waitFor()
+  assert.equal(await page.getByRole('dialog').count(), 0, 'unhiding does not reopen the previous dialog')
+  await page.waitForFunction(() => localStorage.getItem('dsh.subscriptions.usageBadgeMode') === 'recent')
+  console.log('70%: compact Antigravity, cross-tab hiding and persisted preference verified')
+  await page.evaluate(() => {
+    window.savedSetItem = Storage.prototype.setItem
+    Storage.prototype.setItem = function (key, value) {
+      if (key === 'dsh.subscriptions.usageBadgeMode') throw new DOMException('full', 'QuotaExceededError')
+      return window.savedSetItem.call(this, key, value)
+    }
+  })
+  await control.selectOption('hidden')
+  await page.getByRole('alert').waitFor()
+  assert.equal(await control.inputValue(), 'recent')
+  assert.equal(await badge.count(), 1)
+  await page.evaluate(() => { Storage.prototype.setItem = window.savedSetItem })
+  await control.selectOption('hidden')
+  await page.getByRole('alert').waitFor({ state: 'detached' })
+  await page.getByRole('button', { name: 'Locale', exact: true }).click()
+  await page.getByRole('combobox', { name: '状态栏额度显示', exact: true }).waitFor()
+  await page.setViewportSize({ width: 360, height: 720 })
+  assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), true)
+  const remotePage = await context.newPage()
+  remotePage.on('pageerror', error => errors.push(error.message))
+  await remotePage.clock.install()
+  await remotePage.goto('http://subscription-usage.test/?remote=1')
+  await remotePage.getByRole('combobox', { name: 'Status-bar quota display', exact: true }).selectOption('recent')
+  const remoteBadge = remotePage.locator('[data-composer-stats] button')
+  await remotePage.getByRole('button', { name: 'antigravity', exact: true }).click()
+  await remotePage.waitForFunction(() => document.querySelector('[data-composer-stats] button')?.textContent?.includes('42% used'))
+  assert.match(await remoteBadge.innerText(), /42% used.*Laptop bridge/)
+  await remotePage.getByRole('button', { name: 'codex', exact: true }).click()
+  await remotePage.waitForFunction(() => document.querySelector('[data-composer-stats] button')?.textContent?.includes(' · actual ·'))
+  assert.match(await remoteBadge.innerText(), /71%.* · actual ·/)
+  await remoteBadge.click()
+  assert.match(await remotePage.getByRole('dialog').innerText(), /default…/)
+  // Repeated owner failures keep cached rows and retry for the whole mount lifetime.
+  await remotePage.getByRole('button', { name: 'Offline', exact: true }).click()
+  await remotePage.clock.fastForward(15 * 60_000)
+  const failedCalls = await remotePage.evaluate(() => Number(document.documentElement.dataset.statusCalls))
+  await remotePage.clock.runFor(40_000)
+  assert.ok(await remotePage.evaluate(() => Number(document.documentElement.dataset.statusCalls)) >= failedCalls + 3)
+  assert.match(await remoteBadge.innerText(), /71%.* · actual ·/)
+  await remotePage.getByRole('button', { name: 'Recover', exact: true }).click()
+  await remotePage.clock.runFor(11_000)
+  await remoteBadge.click()
+  assert.match(await remotePage.getByRole('dialog').innerText(), /72%/)
+  await remotePage.keyboard.press('Escape')
+  await remotePage.getByRole('button', { name: 'Hang status', exact: true }).click()
+  await remotePage.clock.fastForward(15 * 60_000)
+  const modeControl = remotePage.getByRole('combobox', { name: 'Status-bar quota display', exact: true })
+  await modeControl.selectOption('hidden')
+  assert.equal(await remotePage.evaluate(() => document.documentElement.dataset.aborted), 'true')
+  await remotePage.getByRole('button', { name: 'Unhang status', exact: true }).click()
+  const beforeShow = await remotePage.evaluate(() => Number(document.documentElement.dataset.statusCalls))
+  await modeControl.selectOption('recent')
+  await remotePage.waitForFunction(before => Number(document.documentElement.dataset.statusCalls) > before, beforeShow)
+  assert.ok(await remotePage.evaluate(() => Number(document.documentElement.dataset.statusCalls)) > beforeShow, 'new lifetime refreshes before advancing the old abort timer')
+  await remotePage.getByRole('button', { name: 'Unmount badge', exact: true }).click()
+  const stoppedCalls = await remotePage.evaluate(() => Number(document.documentElement.dataset.statusCalls))
+  await remotePage.clock.fastForward(16 * 60_000)
+  assert.equal(await remotePage.evaluate(() => Number(document.documentElement.dataset.statusCalls)), stoppedCalls)
+  const prefetchPage = await context.newPage()
+  prefetchPage.on('pageerror', error => errors.push(error.message))
+  prefetchPage.setDefaultTimeout(10_000)
+  await prefetchPage.clock.install()
+  await prefetchPage.goto('http://subscription-usage.test/?remote=1&prefetch=1')
+  const prefetchBadge = prefetchPage.locator('[data-composer-stats] button')
+  const prefetchPanel = prefetchPage.getByRole('dialog', { name: title, exact: true })
+  const bridgeRows = prefetchPanel.locator('tbody').filter({ has: prefetchPage.getByRole('rowheader', { name: 'Antigravity', exact: true }) })
+  const click = name => prefetchPage.getByRole('button', { name, exact: true }).click()
+  const countReads = () => prefetchPage.evaluate(() => {
+    const data = document.documentElement.dataset
+    return { accounts: Number(data.bridgeAccountCalls ?? 0), models: Number(data.bridgeModelCalls ?? 0), aborts: Number(data.bridgeAborts ?? 0) }
+  })
+  await prefetchBadge.filter({ hasText: /^Codex/ }).waitFor()
+  await prefetchPage.waitForFunction(() => document.documentElement.dataset.bridgeAccountCalls === '2')
+  assert.deepEqual(await countReads(), { accounts: 2, models: 0, aborts: 0 }, 'visible Codex badge prefetches both Google accounts before any popover')
+  assert.equal(await prefetchPanel.count(), 0)
+  const showBridge = async percent => {
+    await prefetchBadge.click()
+    await bridgeRows.locator(`[aria-valuetext="${percent}% used"]`).first().waitFor()
+    assert.equal(await bridgeRows.locator(`[aria-valuetext="${percent}% used"]`).count(), 2)
+  }
+  await showBridge(34)
+  assert.match(await bridgeRows.innerText(), /Laptop bridge/)
+  await prefetchPage.keyboard.press('Escape')
+  await prefetchPage.evaluate(() => window.dispatchEvent(new Event('focus')))
+  await showBridge(34)
+  assert.deepEqual(await countReads(), { accounts: 2, models: 0, aborts: 0 }, 'reopen and focus reuse warmed account rows')
+  await prefetchPage.keyboard.press('Escape')
+  await click('antigravity')
+  await prefetchBadge.filter({ hasText: '42% used' }).waitFor()
+  await click('Fail Google usage')
+  await prefetchPage.clock.fastForward(290_000)
+  assert.deepEqual(await countReads(), { accounts: 2, models: 1, aborts: 0 }, 'neither quota path polls ahead of the five-minute interval')
+  await prefetchPage.clock.fastForward(12_000)
+  assert.deepEqual(await countReads(), { accounts: 4, models: 2, aborts: 0 })
+  await prefetchBadge.filter({ hasText: /42% used.*Laptop bridge.*refresh unavailable/ }).waitFor()
+  await showBridge(34)
+  assert.match(await bridgeRows.innerText(), /Last known usage; refresh unavailable/)
+  await prefetchPage.keyboard.press('Escape')
+  await click('Recover Google usage')
+  await prefetchPage.clock.fastForward(290_000)
+  assert.deepEqual(await countReads(), { accounts: 4, models: 2, aborts: 0 }, 'failed reads use the same interval, not the previous fast retry')
+  await prefetchPage.clock.fastForward(12_000)
+  assert.deepEqual(await countReads(), { accounts: 6, models: 3, aborts: 0 })
+  assert.doesNotMatch(await prefetchBadge.innerText(), /refresh unavailable/)
+  await showBridge(34)
+  assert.doesNotMatch(await bridgeRows.innerText(), /refresh unavailable/)
+  await prefetchPage.keyboard.press('Escape')
+  await click('Hang Google quota')
+  await prefetchPage.clock.fastForward(300_001)
+  assert.deepEqual(await countReads(), { accounts: 8, models: 4, aborts: 0 })
+  const lifecycle = prefetchPage.getByRole('combobox', { name: 'Status-bar quota display', exact: true })
+  await lifecycle.selectOption('hidden')
+  assert.deepEqual(await countReads(), { accounts: 8, models: 4, aborts: 3 }, 'hiding aborts both account reads and the focused read')
+  await prefetchPage.clock.fastForward(600_000)
+  assert.deepEqual(await countReads(), { accounts: 8, models: 4, aborts: 3 }, 'hidden badge makes no further quota requests')
+  await click('Unhang Google quota')
+  await lifecycle.selectOption('recent')
+  await prefetchBadge.filter({ hasText: '42% used' }).waitFor()
+  await click('Switch to local session')
+  await prefetchBadge.filter({ hasText: '30% used' }).waitFor()
+  await showBridge(29)
+  assert.match(await bridgeRows.innerText(), /Local bridge/)
+  assert.doesNotMatch(await bridgeRows.innerText(), /Laptop bridge/)
+  await prefetchPage.keyboard.press('Escape')
+  await click('Hang Google quota')
+  await prefetchPage.clock.fastForward(300_001)
+  const beforeUnmount = await countReads()
+  await click('Unmount badge')
+  await prefetchPage.clock.fastForward(600_000)
+  assert.deepEqual(await countReads(), { ...beforeUnmount, aborts: beforeUnmount.aborts + 3 }, 'unmount aborts live reads and stops quota polling')
+  console.log('PASS: Google quota prefetch, cache reuse, five-minute cadence, stale data and owner lifecycle')
+
+  const solePage = await context.newPage()
+  solePage.on('pageerror', error => errors.push(error.message))
+  await solePage.goto('http://subscription-usage.test/?placeholder=1')
+  await solePage.getByRole('button', { name: 'antigravity', exact: true }).click()
+  await solePage.locator('[data-composer-stats] button').click()
+  const soleProvider = solePage.getByRole('table').locator('tbody').first()
+  await soleProvider.getByRole('progressbar').waitFor()
+  assert.equal(await soleProvider.locator('.dsh-quota-account').count(), 0)
+  assert.doesNotMatch(await soleProvider.innerText(), /This Mac|sole-system/)
+  assert.deepEqual(errors, [])
+  console.log('100%: offline badge browser checks passed, including reset keyboard, sole bridge placeholder, storage errors and bilingual setting')
+} finally { await browser.close() }

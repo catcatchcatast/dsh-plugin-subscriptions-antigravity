@@ -1,0 +1,182 @@
+// 变更追溯：CHG-20261124-113809-agy-shell-c58464c9；记录：.codex/doc/change-history/CHG-20261124-113809-agy-shell-c58464c9.md
+import { test } from 'node:test'
+import assert from 'node:assert/strict'
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { ProviderSettingsStore, validatePreferences } from '../src/provider-settings.js'
+
+test('display names persist per provider, trim whitespace and clear back to defaults', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'display-names-'))
+  try {
+    const store = new ProviderSettingsStore(join(dir, 'settings.json'))
+    await store.set('grok', { displayName: '  我的 Grok  ', modelDisplayNames: { shared: '主力模型', gone: '暂不可用' } })
+    await store.set('codex', { modelDisplayNames: { shared: '工作模型' } })
+    const reload = new ProviderSettingsStore(store.path)
+    assert.equal(reload.get('grok').displayName, '我的 Grok')
+    assert.equal(reload.get('grok').modelDisplayNames?.shared, '主力模型')
+    assert.equal(reload.get('codex').modelDisplayNames?.shared, '工作模型')
+    assert.equal(reload.get('grok').modelDisplayNames?.gone, '暂不可用')
+    await reload.set('grok', { displayName: '  ', modelDisplayNames: { shared: '' } })
+    assert.equal(reload.get('grok').displayName, undefined)
+    assert.equal(reload.get('grok').modelDisplayNames?.shared, undefined)
+    for (const input of [{ displayName: 7 }, { displayName: 'x'.repeat(81) }, { modelDisplayNames: [] }, { modelDisplayNames: { m: false } }]) {
+      assert.throws(() => validatePreferences('grok', input))
+    }
+    const safe = validatePreferences('grok', JSON.parse('{"modelDisplayNames":{"__proto__":"Safe","toString":"Also safe"}}'))
+    assert.equal(safe.modelDisplayNames?.['__proto__'], 'Safe')
+  } finally { await rm(dir, { recursive: true, force: true }) }
+})
+
+test('Codex global budgets validate, persist, and clear independently of per-model settings', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'codex-budgets-'))
+  try {
+    const store = new ProviderSettingsStore(join(dir, 'settings.json'))
+    await store.set('codex', { contextWindow: 240000, defaultMaxTokens: 32768, contextWindows: { m: 180000 } })
+    const reload = new ProviderSettingsStore(store.path)
+    assert.deepEqual(reload.get('codex'), { contextWindow: 240000, defaultMaxTokens: 32768, contextWindows: { m: 180000 } })
+    for (const field of ['contextWindow', 'defaultMaxTokens']) {
+      for (const invalid of [0, -1, 1.5, Number.MAX_SAFE_INTEGER + 1, Infinity, NaN, null, '5', true]) {
+        assert.throws(() => validatePreferences('codex', { [field]: invalid }), /positive safe integer/)
+      }
+      for (const provider of ['claude', 'grok', 'copilot'] as const) {
+        assert.throws(() => validatePreferences(provider, { [field]: 100 }), /only for Codex/)
+      }
+    }
+    await reload.set('codex', { contextWindows: { m: 180000 } })
+    assert.equal(new ProviderSettingsStore(store.path).get('codex').contextWindow, undefined)
+    assert.equal(new ProviderSettingsStore(store.path).get('codex').defaultMaxTokens, undefined)
+    assert.equal(reload.contextWindow('m'), 180000)
+  } finally { await rm(dir, { recursive: true, force: true }) }
+})
+
+test('the Claude prompt-cache TTL is a Claude-only preference that persists and clears', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'cache-ttl-'))
+  try {
+    const store = new ProviderSettingsStore(join(dir, 'settings.json'))
+    assert.equal(store.promptCacheTtl(), undefined, 'absent follows the plugin config')
+    await store.set('claude', { promptCacheTtl: '1h' })
+    assert.equal(store.promptCacheTtl(), '1h')
+    assert.equal(new ProviderSettingsStore(store.path).promptCacheTtl(), '1h', 'survives a reload')
+    await store.set('claude', { displayName: 'Work Claude' })
+    assert.equal(store.promptCacheTtl(), undefined, 'a save without the field clears it')
+    for (const invalid of ['2h', '5M', 5, '', null, true]) {
+      assert.throws(() => validatePreferences('claude', { promptCacheTtl: invalid }), /promptCacheTtl/, `rejects ${JSON.stringify(invalid)}`)
+    }
+    assert.throws(() => validatePreferences('codex', { promptCacheTtl: '1h' }), /only for Claude/)
+  } finally { await rm(dir, { recursive: true, force: true }) }
+})
+
+test('provider selections survive refresh-independent reloads and concurrent provider saves', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'provider-settings-'))
+  try {
+    const path = join(dir, 'settings.json')
+    const store = new ProviderSettingsStore(path)
+    assert.equal(store.visible('codex', 'future-model'), true)
+    await Promise.all([
+      store.set('codex', { visibleModels: ['gpt-6-astra'], contextWindows: { 'gpt-6-astra': 512000 } }),
+      store.set('grok', { visibleModels: [] }),
+    ])
+    const reload = new ProviderSettingsStore(path)
+    assert.equal(reload.visible('codex', 'gpt-6-astra'), true)
+    assert.equal(reload.visible('codex', 'future-model'), false)
+    assert.equal(reload.visible('grok', 'grok-4'), false)
+    assert.equal(reload.contextWindow('gpt-6-astra'), 512000)
+    await reload.set('codex', {})
+    assert.equal(reload.visible('codex', 'future-model'), true)
+    assert.equal(reload.contextWindow('gpt-6-astra'), undefined)
+  } finally { await rm(dir, { recursive: true, force: true }) }
+})
+
+test('retired Google settings are left unchanged when another provider saves', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'retired-google-settings-'))
+  try {
+    const path = join(dir, 'settings.json')
+    const antigravity = { visibleModels: ['gemini-old'], accounts: { old: { alias: 'Old' } } }
+    const original = JSON.stringify({ providers: { antigravity }, toolHistory: [] })
+    await writeFile(path, original)
+    const store = new ProviderSettingsStore(path)
+    assert.equal(await readFile(path, 'utf8'), original)
+    await store.set('codex', { visibleModels: ['new-model'] })
+    assert.deepEqual(JSON.parse(await readFile(path, 'utf8')).providers.antigravity, antigravity)
+  } finally { await rm(dir, { recursive: true, force: true }) }
+})
+
+test('tool policies retain old-session settings across changes and restarts', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'provider-tools-'))
+  try {
+    const path = join(dir, 'settings.json')
+    const store = new ProviderSettingsStore(path)
+    await store.set('codex', { tools: { image_generate: false, web_search: false } })
+    const doc = JSON.parse(await readFile(path, 'utf8'))
+    const at = doc.toolHistory[0].at as number
+    const reload = new ProviderSettingsStore(path)
+    assert.equal(reload.toolEnabled('codex', 'image_generate', at - 1), true)
+    assert.equal(reload.toolEnabled('codex', 'image_generate', at + 1), false)
+    assert.equal(reload.toolEnabled('codex', 'web_search', at + 1), false)
+    assert.equal(reload.toolEnabled('grok', 'image_generate', at + 1), true)
+    assert.equal(reload.toolEnabled('grok', 'x_search', at + 1), true)
+    await new Promise(resolve => setTimeout(resolve, 5))
+    await reload.set('codex', { tools: { image_generate: true, web_search: true } })
+    const again = new ProviderSettingsStore(path)
+    assert.equal(again.toolEnabled('codex', 'image_generate', at + 1), false)
+    assert.equal(again.toolEnabled('codex', 'image_generate', Date.now() + 1), true)
+    assert.equal(again.toolEnabled('codex', 'web_search', Date.now() + 1), true)
+  } finally { await rm(dir, { recursive: true, force: true }) }
+})
+
+test('provider settings reject invalid contexts and unsupported tools; ids are safe object keys', () => {
+  for (const value of [0, -1, 1.2, Infinity, NaN, '500000']) {
+    assert.throws(() => validatePreferences('codex', { contextWindows: { model: value } }))
+  }
+  assert.throws(() => validatePreferences('claude', { tools: { image_generate: false } }))
+  assert.throws(() => validatePreferences('codex', { tools: { video_generate: true } }))
+  assert.throws(() => validatePreferences('codex', { visibleModels: [null] }))
+  const prefs = validatePreferences('codex', JSON.parse('{"contextWindows":{"__proto__":512000,"toString":123}}'))
+  assert.equal(prefs.contextWindows?.['__proto__'], 512000)
+  assert.equal(prefs.contextWindows?.['toString'], 123)
+})
+
+test('failed persistence leaves live settings unchanged and permits a later retry', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'provider-failure-'))
+  const { mkdir } = await import('node:fs/promises')
+  const store = new ProviderSettingsStore(join(dir, 'settings.json'))
+  // Put a directory at the target after construction to force atomic rename failure.
+  await mkdir(store.path)
+  try {
+    await assert.rejects(store.set('codex', { visibleModels: [] }))
+    assert.equal(store.visible('codex', 'm'), true)
+    await rm(store.path, { recursive: true })
+    await store.set('codex', { visibleModels: [] })
+    assert.equal(store.visible('codex', 'm'), false)
+  } finally { await rm(dir, { recursive: true, force: true }) }
+})
+
+test('Codex subagent speed defaults persist independently and validate model keys and tiers', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'subagent-speeds-'))
+  const path = join(dir, 'settings.json')
+  try {
+    const store = new ProviderSettingsStore(path)
+    assert.equal(store.subagentSpeed('m'), 'standard')
+    await store.set('codex', { subagentSpeeds: { m: 'fast', other: 'standard' }, contextWindows: { m: 512000 } })
+    const restored = new ProviderSettingsStore(path)
+    assert.equal(restored.subagentSpeed('m'), 'fast')
+    assert.equal(restored.subagentSpeed('other'), 'standard')
+    assert.equal(restored.subagentSpeed('missing'), 'standard')
+    assert.equal(restored.contextWindow('m'), 512000)
+    const copy = restored.get('codex')
+    copy.subagentSpeeds!.m = 'standard'
+    assert.equal(restored.subagentSpeed('m'), 'fast')
+    await restored.set('codex', { subagentSpeeds: JSON.parse('{"__proto__":"fast","toString":"standard"}') })
+    const safe = new ProviderSettingsStore(path)
+    assert.equal(safe.subagentSpeed('__proto__'), 'fast')
+    assert.equal(safe.subagentSpeed('toString'), 'standard')
+    assert.equal(safe.subagentSpeed('constructor'), 'standard')
+    await safe.set('codex', {})
+    assert.equal(safe.subagentSpeed('__proto__'), 'standard')
+    for (const subagentSpeeds of [null, [], 'fast', { m: true }, { m: 'priority' }, { '': 'fast' }]) {
+      assert.throws(() => validatePreferences('codex', { subagentSpeeds }), /subagent speeds/)
+    }
+    assert.throws(() => validatePreferences('claude', { subagentSpeeds: { m: 'fast' } }), /only for Codex/)
+  } finally { await rm(dir, { recursive: true, force: true }) }
+})
