@@ -36,6 +36,19 @@ test('bridge groups preserve active, inactive and explicit windows across quota 
   }
 })
 
+// 变更追溯：CHG-20261126-152200-quota-epoch-92b178e0；验证截图对应的账户详情行。
+test('agy epoch reset is unknown without hiding zero usage or real expired windows', async () => {
+  const { AntigravityUsage } = await import('../src/client/AntigravityUsage.js')
+  const now = Date.parse('2026-11-26T07:15:00Z')
+  for (const [resetTime, expected] of [['1970-01-01T00:00:00Z', '—'], ['2026-11-25T00:00:00Z', zh.quotaDetailResetPassed]] as const) {
+    const account = { id: 'system', label: 'This Mac', enabled: true, state: 'ready' as const }
+    const groups = [{ ...gemini, name: 'Claude/GPT', buckets: [{ ...generic, remainingFraction: 1, resetTime }] }]
+    const html = renderToStaticMarkup(createElement(AntigravityUsage, { rpc: { call: () => { throw Error('unexpected RPC') } }, status: { displayName: 'Antigravity', state: 'ready', accounts: [account] }, error: undefined, t: translate(zh), mode: 'used', detailNow: now, snapshots: new Map([[account.id, { quota: { ...quota, groups }, loading: false }]]) }))
+    assert.match(html, /aria-valuenow="0"/)
+    assert.ok(html.includes(`>${expected}<`), `reset ${resetTime} should display ${expected}`)
+  }
+})
+
 test('the compact pill trusts bridge focus and cannot borrow quota for another account or model', () => {
   const t = translate(en)
   assert.equal(antigravityCompactQuota(quota, model, t, 'used'), '27% used · 7% used · Bridge account A')

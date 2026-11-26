@@ -1,10 +1,11 @@
+// 变更追溯：CHG-20261126-152200-quota-epoch-92b178e0；零时间戳不表示额度到期。
 // 变更追溯：CHG-20261124-152158-preview-parity-2fdd82c1；记录：.codex/doc/change-history/CHG-20261124-152158-preview-parity-2fdd82c1.md
 // 变更追溯：CHG-20261124-145318-quota-models-47c9e254；记录：.codex/doc/change-history/CHG-20261124-145318-quota-models-47c9e254.md
 // 变更追溯：CHG-20261124-113809-agy-shell-c58464c9；记录：.codex/doc/change-history/CHG-20261124-113809-agy-shell-c58464c9.md
 import { useCallback, useEffect, useState } from 'react'
 import type { ConnectionHandle } from '@deepseek-ai/dsh-api-remotes/client'
 import type { AntigravityQuota, AntigravityStatus } from '../antigravity-bridge.js'
-import { antigravityUsedPercent, antigravityWindowLabel, AntigravityQuotaSummary } from './AntigravityQuotaSummary.js'
+import { antigravityResetTime, antigravityUsedPercent, antigravityWindowLabel, AntigravityQuotaSummary } from './AntigravityQuotaSummary.js'
 import type { SubscriptionsKey } from './locales.js'
 import { ProviderRefreshButton } from './ProviderRefreshButton.js'
 import { QuotaDetailNote, QuotaDetailRow } from './QuotaDetailTable.js'
@@ -163,7 +164,7 @@ function AntigravityAccountUsage({ rpc, account, t, mode, refreshable, detail, s
         const period = detailPeriod(bucket)
         const label = period === 'short' ? t('quotaDetailFiveHours') : period === 'weekly' ? t('usageWeekly') : antigravityWindowLabel(bucket, t)
         return <QuotaDetailRow key={`${groupIndex}:${bucket.id}`} label={`${detailGroupName(group)} · ${label}`}
-          used={antigravityUsedPercent(bucket)} resetsAt={Date.parse(bucket.resetTime)} inactive={bucket.disabled} mode={mode} now={detail.now} t={t} />
+          used={antigravityUsedPercent(bucket)} resetsAt={antigravityResetTime(bucket.resetTime)} inactive={bucket.disabled} mode={mode} now={detail.now} t={t} />
       })
     })}
   </>

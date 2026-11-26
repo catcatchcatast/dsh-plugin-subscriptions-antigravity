@@ -1,3 +1,4 @@
+// 变更追溯：CHG-20261126-152200-quota-epoch-92b178e0；零时间戳不表示额度到期。
 // 变更追溯：CHG-20261124-145318-quota-models-47c9e254；记录：.codex/doc/change-history/CHG-20261124-145318-quota-models-47c9e254.md
 // 变更追溯：CHG-20261124-113809-agy-shell-c58464c9；记录：.codex/doc/change-history/CHG-20261124-113809-agy-shell-c58464c9.md
 import type { AntigravityQuota } from '../antigravity-bridge.js'
@@ -16,6 +17,11 @@ function weekly(bucket: Group['buckets'][number]): boolean {
 export function antigravityWindowLabel(bucket: Group['buckets'][number], t: Translate): string {
   return weekly(bucket) ? t('usageWeeklyLimit') : /5h|five.hour/i.test(`${bucket.window} ${bucket.id}`)
     ? t('usageFiveHourLimit') : bucket.window || bucket.name || t('usageWindow')
+}
+
+export function antigravityResetTime(value: string): number | undefined {
+  const time = Date.parse(value)
+  return Number.isFinite(time) && time !== 0 ? time : undefined
 }
 
 export function antigravityUsedPercent(bucket: Group['buckets'][number]): number {
@@ -46,14 +52,14 @@ export function AntigravityQuotaSummary({ groups, t, mode }: {
             const label = antigravityWindowLabel(bucket, t)
             const used = antigravityUsedPercent(bucket)
             const percent = quotaPercent(used, mode)
-            const reset = Date.parse(bucket.resetTime)
+            const reset = antigravityResetTime(bucket.resetTime)
             const color = usageBarColor(used)
             return <div key={bucket.id} style={{ display: 'grid', gap: 4 }}>
               <div style={{ display: 'flex', justifyContent: 'space-between', gap: 12, fontSize: 12 }}>
                 <span>{label}</span>
                 <span style={{ textAlign: 'right', color: bucket.disabled ? undefined : color }}>
                   {bucket.disabled ? t('antigravityQuotaInactive') : quotaText(used, mode, t)}
-                  {!bucket.disabled && Number.isFinite(reset) && ` · ${reset <= Date.now() ? t('quotaExpiredWindow') : t('usageResets', { date: new Date(reset).toLocaleString() })}`}
+                  {!bucket.disabled && reset !== undefined && ` · ${reset <= Date.now() ? t('quotaExpiredWindow') : t('usageResets', { date: new Date(reset).toLocaleString() })}`}
                 </span>
               </div>
               {!bucket.disabled && percent !== undefined && <div role="progressbar" aria-label={`${group.name} · ${label}`}

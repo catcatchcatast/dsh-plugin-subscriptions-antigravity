@@ -1,5 +1,15 @@
 # 变更记录
 
+## 0.9.14-local.10
+
+- `agy` 未提供额度重置时间时，不再把零时间戳标为「已过」。明细显示 `—`，保留 `0%` 和实际重置时间的显示。
+- Treat the `agy` epoch reset timestamp as unknown. Quota details show `—` while still showing `0%` usage and actual reset times.
+
+## 0.9.14-local.9
+
+- 同步 [bridge `92b178e0`](https://github.com/catcatchcatast/dsh-antigravity-bridge/commit/92b178e00bc37c128ec1353b267f4288f8e6a6f1)。长历史分片交接停滞时，收到 ACP 取消回执后才重发同一分片；与当前回答共享最多五次自动续接的预算。
+- Sync [bridge `92b178e0`](https://github.com/catcatchcatast/dsh-antigravity-bridge/commit/92b178e00bc37c128ec1353b267f4288f8e6a6f1). A stalled history fragment is retried only after ACP acknowledges cancellation, using the same five-retry budget as the active answer.
+
 ## 0.9.14-local.8
 
 - 同步 [bridge `556c7d1`](https://github.com/catcatchcatast/dsh-antigravity-bridge/commit/556c7d1486c9cc094de548db8ab48119025d3614)。模型停滞后自动续接时，允许重新查询任务输出、代理列表、文件和搜索结果。其他已完成工具若以相同参数再次调用，仍暂停确认。

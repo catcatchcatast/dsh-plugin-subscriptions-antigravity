@@ -19,7 +19,7 @@ import { applyModelAndEffort, detachBridge, freshReanswer, historyPrefixIntact, 
 import { AccountPool, accountProfileOf, accountVisibleModels, buildLayouts, ensureLayout, familyForModel, pluginHome, proxyUrlFromEnv, SYSTEM_ACCOUNT_ID, TRANSIENT_COOLDOWN_MS, } from "./accounts.js";
 import { ModelCatalog, intersectVisible, isListedModel, nearestEffort } from "./catalog.js";
 import { asDegradeAction, asEffort, asEngineMode, current, EFFORTS } from "./config.js";
-import { AcpTurn, AWAIT_TOOL, AWAIT_TOOL_NAME, CALL_TOOL, CALL_TOOL_NAME, degradedRouteError, isReanswerFailure, pumpStep, relayNotice, reportsUpstream429, upstreamRequestId } from "./conversation.js";
+import { AcpTurn, idleError, AWAIT_TOOL, AWAIT_TOOL_NAME, CALL_TOOL, CALL_TOOL_NAME, degradedRouteError, isReanswerFailure, pumpStep, relayNotice, reportsUpstream429, upstreamRequestId } from "./conversation.js";
 import { addBridgeSystemInstruction, bridgeContextBlock, promptTextBytes, BRIDGE_TEXT_BYTES, bridgeSystemIdentity, inputPrompt, LOCKED_REPLAY_BUDGET_BYTES, prepareNativeRequest, splitReplay, renderFullToolContracts, renderTranscript, replayPrompt, splitSystem, UNLOCKED_REPLAY_BUDGET_BYTES, } from "./history.js";
 import { labeled } from "./labels.js";
 import { JsonRpcClosedError, JsonRpcRemoteError } from "./jsonrpc.js";
@@ -1167,9 +1167,10 @@ export class AntigravityRuntime {
             blocks = addBridgeSystemInstruction(blocks, systemText, conv.tenantKey !== undefined, plan.rebuild && plan.history.length > 0);
         }
         const nextKnownIds = messageIds(preparedMessages);
-        const finalBlocks = await this.handoff(conv, proc, blocks, plan.rebuild && plan.history.length > 0, options.signal);
+        const nextTurn = new AcpTurn(this.nextTurnTag(preparedMessages), engineMode === 'native');
+        const finalBlocks = await this.handoff(conv, proc, blocks, plan.rebuild && plan.history.length > 0, nextTurn.idleRecovery, options.signal);
         conv.reportedToolCalls.clear();
-        conv.turn = new AcpTurn(this.nextTurnTag(preparedMessages), engineMode === 'native');
+        conv.turn = nextTurn;
         conv.health.beginTurn();
         // Record the request this prompt belongs to; a rebuild above (which
         // replaced the whole bookkeeping object) already cleared it.
@@ -1260,10 +1261,11 @@ export class AntigravityRuntime {
         conv.sandboxMode = sandboxMode;
         conv.writableRoots = writableRoots;
         const hasHistory = fresh && planPrompt(conv, systemIdentity, messages, this.host.config.provider).history.length > 0;
-        const finalBlocks = await this.handoff(conv, proc, blocks, hasHistory, options.signal);
+        const nextTurn = new AcpTurn(this.nextTurnTag(messages), engineMode === 'native');
+        const finalBlocks = await this.handoff(conv, proc, blocks, hasHistory, nextTurn.idleRecovery, options.signal);
         if (fresh && conv.sessionId !== undefined)
             this.pinUsageCursors(conv, sessionDbPath(slot.layout.geminiDir, conv.sessionId));
-        conv.turn = new AcpTurn(this.nextTurnTag(messages), engineMode === 'native');
+        conv.turn = nextTurn;
         this.lastAccount = slot.layout.id;
         this.pool.touch(slot.layout.id);
         this.startPrompt(conv, proc, finalBlocks, engineMode === 'bridge', options.signal);
@@ -1692,7 +1694,7 @@ export class AntigravityRuntime {
         conv.knownIds = undefined;
         conv.dirty = false;
     }
-    async handoff(conv, proc, blocks, hasHistory, signal) {
+    async handoff(conv, proc, blocks, hasHistory, recovery, signal) {
         if (conv.engineMode !== 'bridge')
             return blocks;
         const { parts, final } = splitReplay(blocks, hasHistory);
@@ -1702,8 +1704,13 @@ export class AntigravityRuntime {
         if (finalBytes > BRIDGE_TEXT_BYTES)
             return final;
         try {
-            for (const part of parts)
-                await proc.receiveHistory(conv.sessionId, part, signal);
+            // 交接只传 DSH 已保存的内容。此时 MCP 没有可执行工具的回答轮次。
+            conv.turn = undefined;
+            for (const part of parts) {
+                while (await proc.receiveHistory(conv.sessionId, part, recovery, signal) === 'retry') {
+                    signal?.throwIfAborted();
+                }
+            }
         }
         catch (error) {
             await this.resetSession(conv);
@@ -1724,7 +1731,6 @@ export class AntigravityRuntime {
         turn.modelSignal = signal;
         const sessionId = conv.sessionId;
         let cancelled = false;
-        let resumeAfterCancel = false;
         const cancelOnce = () => {
             if (cancelled || conv.turn !== turn || conv.promptGen !== generation || turn.modelSignal?.aborted)
                 return;
@@ -1743,29 +1749,12 @@ export class AntigravityRuntime {
         turn.cancelUpstreamRetry = cancelOnce;
         turn.onUpstreamRetry = error => interrupt(mapError(error));
         if (waitForFirstResponse) {
-            turn.watchModel(() => {
-                if (turn.modelSignal?.aborted || conv.turn !== turn || conv.promptGen !== generation)
-                    return;
-                if (turn.agentFailure)
-                    return interrupt(turn.agentFailure);
-                if (turn.idleRecovery.retries >= 5)
-                    return interrupt(idleError('已自动续接 5 次，模型仍连续 3 分钟没有进展。已保留本轮进度，可发送“继续”。'));
-                resumeAfterCancel = true;
-                turn.finished = true;
-                turn.stopWatching();
-                cancelOnce();
-                // ACP 的取消是通知；旧 prompt 明确结束后才能在同一会话发送下一条。
-                turn.waitForFirstResponse(() => interrupt(idleError('未收到上次请求的取消回执，自动续接已暂停。')));
-            });
+            turn.watchIdleRecovery(() => !turn.modelSignal?.aborted && conv.turn === turn && conv.promptGen === generation, cancelOnce, interrupt);
         }
         const p = proc.prompt(sessionId, blocks).then((result) => {
             if (conv.turn !== turn || conv.promptGen !== generation)
                 return;
-            if (resumeAfterCancel && result.stopReason === 'cancelled' && !turn.modelSignal?.aborted) {
-                turn.stopWatching();
-                turn.finished = false;
-                turn.idleRecovery.retries++;
-                turn.idleRecovery.beforeRetry = turn.idleRecovery.completed.length;
+            if (!turn.modelSignal?.aborted && turn.resumeAfterIdleCancel(result)) {
                 const next = turn.modelStarted ? [{ type: 'text', text: 'Continue from where you stopped. Keep the existing answer and completed tool results; do not repeat completed actions.' }] : blocks;
                 this.startPrompt(conv, proc, next, true, turn.modelSignal);
                 return;
@@ -1775,7 +1764,7 @@ export class AntigravityRuntime {
             if (conv.turn !== turn || conv.promptGen !== generation)
                 return;
             let failure = mapError(error);
-            if (resumeAfterCancel && failure instanceof LlmError && ['TIMEOUT', 'TRANSPORT', 'SERVER'].includes(failure.code)) {
+            if (turn.awaitingIdleCancel && failure instanceof LlmError && ['TIMEOUT', 'TRANSPORT', 'SERVER'].includes(failure.code)) {
                 failure = idleError(`无法确认上次请求已取消，自动续接已暂停。${failure.message}`);
             }
             if (failure instanceof LlmError && failure.failure.status === 429)
@@ -2114,7 +2103,7 @@ export class AntigravityRuntime {
         }
         if (ended) {
             continuation.push({ type: 'text', text: '\n\nContinue the task with these tool results.' });
-            const blocks = await this.handoff(conv, proc, continuation, false, signal);
+            const blocks = await this.handoff(conv, proc, continuation, false, turn.idleRecovery, signal);
             signal?.throwIfAborted();
             conv.reportedToolCalls.clear();
             conv.turn = new AcpTurn(this.nextTurnTag(messages), conv.engineMode === 'native');
@@ -2614,11 +2603,6 @@ function describeVerdict(verdict) {
 }
 function reanswerKey(options, system) {
     return `${String(options.purpose ?? '')}|${options.model}|${digest(system)}|${messageIds(options.messages).join(',')}`;
-}
-function idleError(message) {
-    if ('fromFailure' in LlmError && typeof LlmError.fromFailure === 'function')
-        return LlmError.fromFailure({ code: 'MODEL_IDLE', message });
-    return new LlmError(message, 'MODEL_IDLE');
 }
 /**
  * Stable failure code of an error. Errors raised inside the plugin already
