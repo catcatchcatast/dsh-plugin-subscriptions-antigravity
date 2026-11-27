@@ -13,6 +13,7 @@
 import { LlmError, ProviderRequestId, ToolCallId } from '@deepseek-ai/dsh-llm';
 import { AGENT_TOOL_PREFIX, CALL_TOOL_NAME } from "./history.js";
 import { labeled } from "./labels.js";
+import { lastGenerationError } from "./usage-db.js";
 import { AsyncQueue, deferred } from "./util.js";
 export { CALL_TOOL_NAME };
 /** Agent-side transport retry notice streamed as message text, e.g. `⚠ API error (attempt 1): …`. */
@@ -202,8 +203,17 @@ export class AcpTurn {
     onModelIdle;
     awaitingTools = 0;
     // 模型续接与用户的同一轮请求共享计数和已完成的调用。
-    idleRecovery = { retries: 0, beforeRetry: 0, completed: [] };
-    modelStarted = false;
+    // 续接沿用本轮诊断。CHG-20261126-204000-agy-idle-cause-92b178e0
+    idleRecovery = {
+        startedAt: Date.now(),
+        dbPath: undefined,
+        notice: undefined,
+        partialText: false,
+        retries: 0,
+        beforeRetry: 0,
+        completed: [],
+    };
+    retryInput = [];
     modelSignal;
     watchModel(onIdle) {
         this.onModelIdle = onIdle;
@@ -219,13 +229,21 @@ export class AcpTurn {
             if (this.agentFailure)
                 return interrupt(this.agentFailure);
             if (this.idleRecovery.retries >= 5)
-                return interrupt(idleError('已自动续接 5 次，模型仍连续 3 分钟没有进展。已保留本轮进度，可发送“继续”。'));
+                return interrupt(this.exhaustedIdleError());
             this.awaitingIdleCancel = true;
             this.finished = true;
             this.stopWatching();
             cancel();
             this.waitForFirstResponse(() => interrupt(idleError('未收到上次请求的取消回执，自动续接已暂停。')));
         });
+    }
+    exhaustedIdleError() {
+        const { dbPath, startedAt, notice, partialText, retries } = this.idleRecovery;
+        const message = (dbPath && lastGenerationError(dbPath, notice?.time ?? startedAt)) ?? notice?.message;
+        // 只显示诊断类别，避免把请求地址与响应体带入会话。
+        const reason = message?.match(/\b(?:unexpected EOF|EOF|ECONNRESET|ETIMEDOUT|ENOTFOUND|EPIPE|TLS handshake timeout|context deadline exceeded|connection reset by peer|connection refused|HTTP(?:\/[\d.]+)? [45]\d\d)\b/i)?.[0];
+        const diagnostic = reason ? 'agy 最近一次生成请求错误为 ' + reason + '。' : message ? 'agy 记录过生成请求错误。' : '';
+        return idleError((partialText ? '模型已返回部分正文。' : '') + diagnostic + '已自动续接 ' + retries + ' 次，模型最后连续 3 分钟没有进展。已保留本轮进度，可发送“继续”。');
     }
     resumeAfterIdleCancel(result) {
         if (!this.awaitingIdleCancel || result.stopReason !== 'cancelled')
@@ -238,7 +256,6 @@ export class AcpTurn {
         return true;
     }
     noteModelProgress() {
-        this.modelStarted = true;
         if (!this.firstResponseTimer)
             return;
         this.clearFirstResponseTimer();
@@ -253,7 +270,6 @@ export class AcpTurn {
         this.waitForFirstResponse(this.onModelIdle);
     }
     async duringTool(work) {
-        this.modelStarted = true;
         this.awaitingTools++;
         this.clearFirstResponseTimer();
         try {
@@ -514,6 +530,8 @@ export class AcpTurn {
             return;
         }
         if (verdict.kind === 'drop') {
+            if (AGENT_RETRY_NOTICE.test(combined))
+                this.idleRecovery.notice = { time: Date.now(), message: combined };
             this.retryNotices++;
             return;
         }
@@ -552,6 +570,8 @@ export class AcpTurn {
             return '';
         }
         if (verdict.kind === 'drop') {
+            if (AGENT_RETRY_NOTICE.test(held))
+                this.idleRecovery.notice = { time: Date.now(), message: held };
             this.retryNotices++;
             return '';
         }
@@ -701,6 +721,8 @@ export async function* pumpStep(turn, host, signal) {
         if (turn.events.peek()?.kind !== 'text') {
             const held = turn.recoverNoticeHold();
             if (held.length > 0) {
+                if (held.trim())
+                    turn.idleRecovery.partialText = true;
                 if (host.holdZeroThoughtText === true && !sawStepThought && !emittedVisibleText) {
                     heldZeroThoughtText += held;
                 }
@@ -719,6 +741,8 @@ export async function* pumpStep(turn, host, signal) {
                 yield* append('reasoning', event.text);
                 break;
             case 'text':
+                if (event.text.trim())
+                    turn.idleRecovery.partialText = true;
                 if (host.holdZeroThoughtText === true && !sawStepThought && !emittedVisibleText) {
                     heldZeroThoughtText += event.text;
                 }

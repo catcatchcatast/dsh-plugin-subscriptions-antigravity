@@ -17,7 +17,7 @@ npm pack --ignore-scripts
 在目标设备上安装到实际使用的 profile（下例为 `web`），再重启对应的 DSH 应用或服务：
 
 ```sh
-dsh plugin --profile web add /absolute/path/to/dsh-plugin-subscriptions-0.9.14-local.10.tgz
+dsh plugin --profile web add /absolute/path/to/dsh-plugin-subscriptions-0.9.14-local.11.tgz
 ```
 
 ## 使用
@@ -33,7 +33,7 @@ corepack pnpm test
 node --test test/bridge-bundle.mjs
 ```
 
-先执行上面的构建命令，再运行集成测试。源码在 `src/`，测试在 `test/`。内置的 [Antigravity bridge](https://github.com/catcatchcatast/dsh-antigravity-bridge/tree/92b178e00bc37c128ec1353b267f4288f8e6a6f1) 固定到 `92b178e0`；只引入后端模块，不加载第二套前端。
+先执行上面的构建命令，再运行集成测试。源码在 `src/`，测试在 `test/`。内置的 [Antigravity bridge](https://github.com/catcatchcatast/dsh-antigravity-bridge/tree/340ca1ec4474551714d2a6f98244e7fc810ab3fd) 固定到 `340ca1ec`；只引入后端模块，不加载第二套前端。
 
 ## 许可
 

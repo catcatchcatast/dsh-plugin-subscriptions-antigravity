@@ -1,5 +1,10 @@
 # 变更记录
 
+## 0.9.14-local.11
+
+- 同步 [bridge `340ca1ec`](https://github.com/catcatchcatast/dsh-antigravity-bridge/commit/340ca1ec4474551714d2a6f98244e7fc810ab3fd)：超时续接沿用当前步骤输入和已保存的工具结果；重试用尽时提示是否有部分正文及本轮可识别的生成错误。
+- Idle recovery reuses the current input and saved tool results. When retries run out, the bridge reports partial output and any recognized generation error for this turn.
+
 ## 0.9.14-local.10
 
 - `agy` 未提供额度重置时间时，不再把零时间戳标为「已过」。明细显示 `—`，保留 `0%` 和实际重置时间的显示。

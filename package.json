@@ -1,6 +1,6 @@
 {
   "name": "dsh-plugin-subscriptions",
-  "version": "0.9.14-local.10",
+  "version": "0.9.14-local.11",
   "description": "ChatGPT, Claude, Grok and Copilot subscriptions, with Google models served by the Antigravity CLI bridge.",
   "license": "MIT",
   "repository": {
