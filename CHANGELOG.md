@@ -1,5 +1,10 @@
 # 变更记录
 
+## 0.9.14-local.12
+
+- 同步 [bridge `04ab8944`](https://github.com/catcatchcatast/dsh-antigravity-bridge/commit/04ab8944ac7d545f8d2e94b4c75e397f149eea69)：确认工具取得进展后重置连续空闲重试计数。
+- Confirmed tool progress resets the consecutive idle-retry count.
+
 ## 0.9.14-local.11
 
 - 同步 [bridge `340ca1ec`](https://github.com/catcatchcatast/dsh-antigravity-bridge/commit/340ca1ec4474551714d2a6f98244e7fc810ab3fd)：超时续接沿用当前步骤输入和已保存的工具结果；重试用尽时提示是否有部分正文及本轮可识别的生成错误。

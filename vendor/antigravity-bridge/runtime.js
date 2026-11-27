@@ -2096,9 +2096,22 @@ export class AntigravityRuntime {
             return true;
         const toolDelta = consumeToolDelta(conv, tools);
         if (conv.engineMode === 'bridge') {
-            for (const { call } of groups) {
-                if (!LIVE_QUERY_TOOLS.has(call.name))
-                    turn.idleRecovery.completed.push({ name: call.name, argumentsJson: call.argumentsJson });
+            const recovery = turn.idleRecovery;
+            // 以 DSH 确认的执行结果计进展，已执行工具的重放记录独立保留。CHG-20261127-132000-agy-idle-progress-340ca1ec
+            for (const { call, message } of groups) {
+                if (LIVE_QUERY_TOOLS.has(call.name)) {
+                    if (message.isError)
+                        continue;
+                    const key = digest([call.name, message.content]);
+                    if (recovery.queryResults.has(key))
+                        continue;
+                    recovery.queryResults.add(key);
+                }
+                else {
+                    recovery.completed.push({ name: call.name, argumentsJson: call.argumentsJson });
+                }
+                if (!message.isError)
+                    recovery.retries = 0;
             }
         }
         turn.modelSignal = signal;
