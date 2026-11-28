@@ -1,5 +1,10 @@
 # 变更记录
 
+## 0.9.14-local.13
+
+- 同步 [bridge `23a7ce24`](https://github.com/catcatchcatast/dsh-antigravity-bridge/commit/23a7ce24e0bcb11f062e73c7acedcd17a66321d5)：检测工作进程漏挂 DSH 工具；若在本轮结束时发现，单个请求最多自动重试一次。
+- Detect missing DSH tools at worker startup or turn end; recovery at turn end retries at most once per request.
+
 ## 0.9.14-local.12
 
 - 同步 [bridge `04ab8944`](https://github.com/catcatchcatast/dsh-antigravity-bridge/commit/04ab8944ac7d545f8d2e94b4c75e397f149eea69)：确认工具取得进展后重置连续空闲重试计数。

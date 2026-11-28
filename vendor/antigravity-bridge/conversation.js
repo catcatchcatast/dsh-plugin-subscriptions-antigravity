@@ -189,6 +189,17 @@ export function isReanswerFailure(error) {
     const code = error?.code;
     return code === 'DEGRADED_ROUTE' || code === 'DEGRADED_ROUTE_EXHAUSTED';
 }
+const BRIDGE_TOOLS_MISSING = Symbol('bridgeToolsMissing');
+/** Retryable failure raised when an `agy` worker runs a bridge turn without mounting DSH MCP tools. */
+export function bridgeToolsMissingError() {
+    const error = new LlmError(labeled('TRANSPORT', 'agy worker 未挂载 DSH MCP 工具，已关闭异常 worker 并自动重连。'), 'TRANSPORT', { providerRetryAfterMs: 1_000 });
+    error[BRIDGE_TOOLS_MISSING] = true;
+    return error;
+}
+/** Whether `error` was raised by {@link bridgeToolsMissingError}. */
+export function isBridgeToolsMissingFailure(error) {
+    return typeof error === 'object' && error !== null && error[BRIDGE_TOOLS_MISSING] === true;
+}
 export function idleError(message) {
     if ('fromFailure' in LlmError && typeof LlmError.fromFailure === 'function')
         return LlmError.fromFailure({ code: 'MODEL_IDLE', message });
@@ -329,6 +340,8 @@ export class AcpTurn {
     retryNotices = 0;
     /** Terminal transport or overload failure reported as message text by agy. */
     agentFailure;
+    /** Observed an `unknown tool: "mcp_dsh_..."` rejection on this turn's ACP stream. */
+    missingBridgeTools = false;
     upstreamStopped = false;
     cancelUpstreamRetry;
     onUpstreamRetry;
@@ -407,6 +420,10 @@ export class AcpTurn {
     hasStagedUsage() {
         return this.stagedUsage !== undefined;
     }
+    /** Inspect staged usage without consuming it (used by end-of-turn guards). */
+    peekStagedUsage() {
+        return this.stagedUsage;
+    }
     /**
      * Drop the usage staged for a step that will never be delivered, counting it as
      * already emitted so a later fallback subtraction never reports it twice.
@@ -472,6 +489,15 @@ export class AcpTurn {
             if (text.length > 0 && !this.relaying)
                 this.events.push({ kind: 'thought', text });
             return;
+        }
+        if (update.sessionUpdate === 'tool_call_update' && update.status === 'failed') {
+            const raw = [
+                text,
+                typeof update.title === 'string' ? update.title : '',
+                typeof update['rawOutput'] === 'string' ? update['rawOutput'] : '',
+            ].join('\n');
+            if (/unknown tool:\s*"mcp_dsh_/i.test(raw))
+                this.missingBridgeTools = true;
         }
         if (this.nativeMode
             && (update.sessionUpdate === 'tool_call' || update.sessionUpdate === 'tool_call_update')
@@ -810,7 +836,8 @@ export async function* pumpStep(turn, host, signal) {
                 }
                 if (stop === 'end_turn' && host.verifyEndTurn !== undefined) {
                     const hadZeroThoughtHold = !sawStepThought && heldZeroThoughtText.length > 0 && !emittedVisibleText;
-                    if (await host.verifyEndTurn(hadZeroThoughtHold) === 'degrade') {
+                    const verdict = await host.verifyEndTurn(hadZeroThoughtHold);
+                    if (verdict === 'degrade') {
                         // The degraded answer is discarded: held text never reaches the
                         // transcript, and the step fails so the harness re-asks the same
                         // request. Reasoning already streamed stays.
@@ -818,6 +845,12 @@ export async function* pumpStep(turn, host, signal) {
                         turn.finished = true;
                         yield* close();
                         throw degradedRouteError();
+                    }
+                    if (verdict === 'missing-tools') {
+                        heldZeroThoughtText = '';
+                        turn.finished = true;
+                        yield* close();
+                        throw bridgeToolsMissingError();
                     }
                 }
                 yield* flushHeldText();
